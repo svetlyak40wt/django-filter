@@ -6,6 +6,7 @@ import mock
 from django import forms
 from django.utils import unittest
 from django.test import TestCase
+from django.db.models import Q
 
 from django_filters.fields import Lookup
 from django_filters.fields import RangeField
@@ -25,6 +26,85 @@ from django_filters.filters import RangeFilter
 from django_filters.filters import DateRangeFilter
 from django_filters.filters import AllValuesFilter
 from django_filters.filters import LOOKUP_TYPES
+
+
+class QHelper(object):
+    def compare_Q(self, left, right):
+        """Returns True if left Q object is equal to right.
+        """
+        if left.connector != right.connector:
+            return False
+        
+        if len(left.children) != len(right.children):
+            return False
+
+        for lchild, rchild in zip(left.children, right.children):
+            equal = False
+            if isinstance(lchild, Q) and isinstance(rchild, Q):
+                equal = self.compare_Q(lchild, rchild)
+            else:
+                equal = lchild == rchild
+                
+            if not equal:
+                return False
+            
+        return True
+
+    def assert_filtered(self, mocked_queryset, query):
+        """This method helps to check if method 'filter'
+        was called on given queryset with given Q object.
+        And this method does not require any mocking mambo-jambo.
+        """
+        
+        self.assertEqual(1, mocked_queryset.filter.call_count)
+        self.assertEqual(1, len(mocked_queryset.filter.call_args[0]))
+        self.assert_(self.compare_Q(query, mocked_queryset.filter.call_args[0][0]),
+                     '{0} != {1}'.format(query, mocked_queryset.filter.call_args[0][0]))
+
+    def assert_is_not_filtered(self, mocked_queryset):
+        """This method helps to check if method 'filter'
+        was not called on given queryset.
+        """
+        
+        self.assertEqual(0,
+                         mocked_queryset.filter.call_count,
+                         'This queryset was filtered with: {0}'.format(
+                mocked_queryset.filter.call_args and mocked_queryset.filter.call_args[0][0]))
+
+
+    
+class QHelperTests(TestCase, QHelper):
+    def test_simple(self):
+        self.assertEqual(True, self.compare_Q(
+                Q(blah='minor'),
+                Q(blah='minor')))
+        
+        self.assertEqual(False, self.compare_Q(
+                Q(blah='minor'),
+                Q(blah='other')))
+
+    def test_complex(self):
+        self.assertEqual(True, self.compare_Q(
+                Q(blah='minor') | Q(another='value'),
+                Q(blah='minor') | Q(another='value')))
+
+        self.assertEqual(False, self.compare_Q(
+                Q(blah='minor') | Q(another='value'),
+                Q(blah='minor') | Q(another='wrong')))
+
+    def test_unbalanced(self):
+        self.assertEqual(False, self.compare_Q(
+                Q(blah='minor', another='value'),
+                Q(blah='minor') | Q(another='value')))
+
+        self.assertEqual(False, self.compare_Q(
+                Q(blah='minor', another='value'),
+                Q(blah='minor')))
+        
+        self.assertEqual(False, self.compare_Q(
+                Q(blah='minor'),
+                Q(blah='minor', another='value')))
+        
 
 
 class FilterTests(TestCase):
@@ -221,7 +301,7 @@ class ChoiceFilterTests(TestCase):
         self.assertIsInstance(field, forms.ChoiceField)
 
 
-class MultipleChoiceFilterTests(TestCase):
+class MultipleChoiceFilterTests(TestCase, QHelper):
 
     def test_default_field(self):
         f = MultipleChoiceFilter()
@@ -237,17 +317,9 @@ class MultipleChoiceFilterTests(TestCase):
     def test_filtering(self):
         qs = mock.Mock(spec=['filter'])
         f = MultipleChoiceFilter(name='somefield')
-        with mock.patch('django_filters.filters.Q') as mockQclass:
-            mockQ1, mockQ2 = mock.MagicMock(), mock.MagicMock()
-            mockQclass.side_effect = [mockQ1, mockQ2]
-
-            f.filter(qs, ['value'])
-
-            self.assertEqual(mockQclass.call_args_list,
-                             [mock.call(), mock.call(somefield='value')])
-            mockQ1.__ior__.assert_called_once_with(mockQ2)
-            qs.filter.assert_called_once_with(mockQ1.__ior__.return_value)
-            qs.filter.return_value.distinct.assert_called_once_with()
+        f.filter(qs, ['value'])
+        self.assert_filtered(qs, Q(somefield='value'))
+        qs.filter.return_value.distinct.assert_called_once_with()
 
     def test_filtering_skipped_when_len_of_value_is_len_of_field_choices(self):
         qs = mock.Mock(spec=[])
@@ -263,13 +335,47 @@ class MultipleChoiceFilterTests(TestCase):
         result = f.filter(qs, ['other', 'values', 'there'])
         self.assertEqual(qs, result)
 
-    @unittest.expectedFailure
     def test_filtering_skipped_with_empty_list_value_and_some_choices(self):
         qs = mock.Mock(spec=[])
         f = MultipleChoiceFilter(name='somefield')
         f.field.choices = ['some', 'values', 'here']
         result = f.filter(qs, [])
         self.assertEqual(qs, result)
+
+    def test_filtering_use_default_value_when_len_of_value_is_zero(self):
+        """Tests if there is no any value, but some default was specified,
+        then this default will be used instead.
+        """
+        qs = mock.Mock(spec=['filter'])
+        f = MultipleChoiceFilter(name='somefield', default=['blah'])
+        f.filter(qs, [])
+        self.assert_filtered(qs, Q(somefield='blah'))
+
+    def test_that_default_value_could_be_ignored(self):
+        """Tests if there is no any value, but some default was specified,
+        then this default will be used instead.
+        """
+        qs = mock.Mock(spec=['filter'])
+        f = MultipleChoiceFilter(name='somefield', default=['blah'])
+        f.filter(qs, ['__any__'])
+        self.assert_is_not_filtered(qs)
+
+    def test_anyvalue_is_added_to_the_choices(self):
+        choices = ((1, 'One'), (2, 'Two'))
+
+        # nothing happens if there is not 'default' value
+        f = MultipleChoiceFilter(choices=choices)
+        self.assertEqual(f.extra['choices'], choices)
+
+        # but if there is 'default', then we should let
+        # user to reset this default and skip filtering
+        f = MultipleChoiceFilter(choices=choices, default=1)
+        self.assertEqual(f.extra['choices'],
+                         choices + (('__any__', 'Any value'),))
+
+        f = MultipleChoiceFilter(choices=choices, default=1, any_value='whatever')
+        self.assertEqual(f.extra['choices'],
+                         choices + (('whatever', 'Any value'),))
 
 
 class DateFilterTests(TestCase):

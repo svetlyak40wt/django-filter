@@ -1,6 +1,7 @@
 from __future__ import absolute_import
 from __future__ import unicode_literals
 
+import operator
 from datetime import timedelta
 
 
@@ -30,7 +31,8 @@ class Filter(object):
     field_class = forms.Field
 
     def __init__(self, name=None, label=None, widget=None, action=None,
-        lookup_type='exact', required=False, distinct=False, exclude=False, **kwargs):
+                 lookup_type='exact', required=False, distinct=False, exclude=False,
+                 default=None, any_value='__any__', **kwargs):
         self.name = name
         self.label = label
         if action:
@@ -38,9 +40,16 @@ class Filter(object):
         self.lookup_type = lookup_type
         self.widget = widget
         self.required = required
+        self.default = default
+        self.any_value = any_value
         self.extra = kwargs
         self.distinct = distinct
         self.exclude = exclude
+
+        # We only want to add __any__ to choices, if 'default' value is
+        # defined. In that case __any__ allows as to reset default
+        if default is not None and 'choices' in self.extra:
+            self.extra['choices'] = tuple(self.extra['choices']) + ((any_value, 'Any value'),)
 
         self.creation_counter = Filter.creation_counter
         Filter.creation_counter += 1
@@ -71,8 +80,12 @@ class Filter(object):
             value = value.value
         else:
             lookup = self.lookup_type
-        if value in ([], (), {}, None, ''):
-            return qs
+            
+        if value in ([], (), {}, None, '', self.any_value):
+            if self.default is None or value == self.any_value:
+                return qs
+            value = self.default
+
         method = qs.exclude if self.exclude else qs.filter
         qs = method(**{'%s__%s' % (self.name, lookup): value})
         if self.distinct:
@@ -104,13 +117,21 @@ class MultipleChoiceFilter(Filter):
     field_class = forms.MultipleChoiceField
 
     def filter(self, qs, value):
-        value = value or ()
-        if len(value) == len(self.field.choices):
+        if not value:
+            if self.default:
+                value = self.default
+            else:
+                value = ()
+
+        if len(value) == len(self.field.choices) or value == [self.any_value]:
             return qs
-        q = Q()
-        for v in value:
-            q |= Q(**{self.name: v})
-        return qs.filter(q).distinct()
+
+        query = [Q(**{self.name: v})
+                 for v in value]
+        if query:
+            query = reduce(operator.__or__, query)
+            qs = qs.filter(query).distinct()
+        return qs
 
 
 class DateFilter(Filter):
